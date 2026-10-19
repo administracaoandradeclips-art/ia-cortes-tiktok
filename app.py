@@ -1,192 +1,121 @@
-import os
-import json
-import subprocess
-import tempfile
-import time
+import os, json, subprocess, tempfile, time
 from pathlib import Path
-
 import streamlit as st
 from google import genai
 from google.genai import types
 
 st.set_page_config(page_title="IA Cortes TikTok", page_icon="✂️", layout="wide")
-
 st.title("✂️ IA Cortes TikTok")
-st.caption("Envie um vídeo, encontre momentos interessantes e prepare cortes para publicar.")
-
-st.info(
-    "Protótipo de teste: a IA sugere momentos promissores, mas não garante viralização. "
-    "Confira todos os cortes antes de publicar."
-)
+st.caption("Cortes automáticos para batalhas de presença do TikTok")
+st.info("Regra fixa: corte 1 = 1min50s; corte 2 = 2min; corte 3 = todo o restante. A IA cria legendas e hashtags com foco em batalha de presença.")
 
 api_key = os.getenv("GEMINI_API_KEY", "")
-try:
-    if not api_key:
-        api_key = st.secrets["GEMINI_API_KEY"]
-except Exception:
-    api_key = api_key or ""
+try: api_key = st.secrets.get("GEMINI_API_KEY", api_key)
+except Exception: pass
 
 with st.sidebar:
-    st.header("Configurações")
-    max_clip = st.slider("Duração máxima de cada corte (segundos)", 30, 120, 120, 15)
-    max_clips = st.slider("Quantidade máxima de cortes", 1, 10, 5)
-    st.caption("Para o primeiro teste, use um vídeo curto de 5 a 10 minutos.")
+    st.header("Regras")
+    st.write("Corte 1: 00:00–01:50")
+    st.write("Corte 2: 01:50–03:50")
+    st.write("Corte 3: 03:50 até o fim")
+    st.caption("Vídeos com menos de 3min50s geram apenas os cortes que couberem.")
 
-uploaded = st.file_uploader("Envie um vídeo", type=["mp4", "mov", "mpeg", "mpg", "webm", "avi"])
+uploaded = st.file_uploader("Envie o vídeo da batalha de presença", type=["mp4","mov","mpeg","mpg","webm","avi"])
 if uploaded:
     st.video(uploaded)
-    st.write(f"Arquivo: **{uploaded.name}** · {uploaded.size / (1024*1024):.1f} MB")
+    st.caption(f"{uploaded.name} · {uploaded.size/(1024*1024):.1f} MB")
 
-if st.button("Analisar vídeo e gerar cortes", type="primary", disabled=uploaded is None):
+def duration_of(path):
+    r=subprocess.run(["ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1",str(path)],capture_output=True,text=True,check=True)
+    return float(r.stdout.strip())
+
+def parse_json(s):
+    s=(s or "").strip()
+    if s.startswith("```"):
+        s=s.split("\n",1)[1]
+        if s.endswith("```"): s=s[:-3]
+    return json.loads(s)
+
+if st.button("Gerar cortes + legendas",type="primary",disabled=uploaded is None):
     if not api_key:
-        st.error("Falta configurar GEMINI_API_KEY em Streamlit → Settings → Secrets.")
+        st.error("Configure GEMINI_API_KEY em Streamlit → Settings → Secrets.")
         st.stop()
-
-    workdir = tempfile.mkdtemp(prefix="ia_cortes_")
-    input_path = Path(workdir) / uploaded.name
-    input_path.write_bytes(uploaded.getvalue())
-
-    # Verify ffmpeg exists before starting the expensive AI call.
+    workdir=tempfile.mkdtemp(prefix="ia_cortes_")
+    src=Path(workdir)/uploaded.name
+    src.write_bytes(uploaded.getvalue())
     try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
-    except Exception:
-        st.error("O FFmpeg não está disponível. Confira se o arquivo packages.txt contém 'ffmpeg' e se o app foi reiniciado.")
+        subprocess.run(["ffmpeg","-version"],capture_output=True,check=True)
+        subprocess.run(["ffprobe","-version"],capture_output=True,check=True)
+        dur=duration_of(src)
+    except Exception as e:
+        st.error(f"FFmpeg/FFprobe indisponível ou vídeo inválido: {e}")
         st.stop()
-
-    client = genai.Client(api_key=api_key)
-
+    segments=[
+        {"number":1,"start":0.0,"end":min(110.0,dur)},
+        {"number":2,"start":110.0,"end":min(230.0,dur)},
+        {"number":3,"start":230.0,"end":dur}
+    ]
+    segments=[s for s in segments if s["end"]>s["start"]]
+    client=genai.Client(api_key=api_key)
     try:
-        with st.spinner("Enviando vídeo para o Gemini..."):
-            video_file = client.files.upload(file=str(input_path))
-            while getattr(video_file, "state", None) and str(video_file.state).upper().endswith("PROCESSING"):
+        with st.spinner("Enviando vídeo para a IA..."):
+            vf=client.files.upload(file=str(src))
+            while getattr(vf,"state",None) and "PROCESSING" in str(vf.state).upper():
                 time.sleep(5)
-                video_file = client.files.get(name=video_file.name)
-
-        prompt = f"""
-Analise este vídeo para encontrar até {max_clips} trechos que possam funcionar como vídeos curtos para TikTok.
-Priorize momentos com começo e fim compreensíveis: histórias, humor, reações, discussões, frases fortes ou acontecimentos surpreendentes.
-Não invente acontecimentos. Os tempos devem corresponder ao vídeo. Cada corte deve durar no máximo {max_clip} segundos.
-Evite trechos sem contexto; quando possível inclua alguns segundos antes da fala ou acontecimento principal.
-Responda SOMENTE com JSON válido neste formato:
-{{
-  "clips": [
-    {{
-      "start": 12.5,
-      "end": 82.0,
-      "title": "título curto",
-      "reason": "por que esse trecho pode interessar",
-      "caption": "legenda curta para a publicação",
-      "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5"],
-      "onscreen_text": "frase curta para aparecer no meio do vídeo",
-      "cover_text": "texto curto para a capa"
-    }}
-  ]
-}}
-Os tempos start/end devem ser números em segundos. Inclua exatamente cinco hashtags relevantes por corte.
+                vf=client.files.get(name=vf.name)
+        ranges=[{"number":s["number"],"start_seconds":s["start"],"end_seconds":s["end"]} for s in segments]
+        prompt=f"""
+Tema obrigatório: batalha de presença do TikTok, duelos ao vivo, torcida, criadores e apoio da audiência.
+Analise o vídeo e gere metadados para estes trechos exatos: {json.dumps(ranges)}.
+Não invente falas ou acontecimentos. Em caso de dúvida, use texto temático geral.
+Para cada corte gere title, caption, hashtags (exatamente cinco hashtags relevantes em português; incluir #BatalhaDePresença e #TikTokLive quando apropriado), onscreen_text (gancho curto para aparecer no meio do vídeo), cover_text (texto curto para capa).
+Retorne apenas JSON válido: {{"clips":[{{"number":1,"title":"...","caption":"...","hashtags":["#...","#...","#...","#...","#..."],"onscreen_text":"...","cover_text":"..."}}]}}
+Inclua um objeto para cada número solicitado.
 """
-        with st.spinner("O Gemini está analisando o conteúdo..."):
-            response = client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=[video_file, prompt],
-                config=types.GenerateContentConfig(temperature=0.2),
-            )
+        with st.spinner("Criando legendas e hashtags..."):
+            res=client.models.generate_content(model="gemini-3.8-flash",contents=[vf,prompt],config=types.GenerateContentConfig(temperature=0.3))
+        metadata=parse_json(res.text)
+        bynum={int(c.get("number",i+1)):c for i,c in enumerate(metadata.get("clips",[]))}
+    except Exception as e:
+        st.error("Não consegui analisar o vídeo. Confira a disponibilidade do modelo Gemini e os limites da API.")
+        st.caption(f"Detalhe técnico: {e}")
+        st.stop()
+    st.success(f"Vídeo com {dur/60:.2f} minutos. Criando {len(segments)} cortes.")
+    st.session_state["segments"]=segments
+    st.session_state["metadata"]=bynum
+    st.session_state["workdir"]=workdir
+    st.session_state["source"]=str(src)
 
-        raw = response.text or ""
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-        data = json.loads(raw)
-        clips = data.get("clips", [])
-        if not clips:
-            st.warning("A IA não encontrou cortes neste vídeo. Tente outro vídeo.")
-            st.stop()
-
-        st.session_state["clips_data"] = clips
-        st.session_state["clips_dir"] = workdir
-        st.session_state["clips_source"] = str(input_path)
-        st.success(f"A IA sugeriu {len(clips)} cortes. Confira os tempos e baixe os arquivos abaixo.")
-
-    except json.JSONDecodeError:
-        st.error("A resposta da IA não veio no formato esperado. Tente novamente com outro vídeo.")
-        st.code(raw[:3000] if "raw" in locals() else "Sem resposta")
-    except Exception as exc:
-        st.error("Não foi possível analisar o vídeo. Confira a chave, os limites da API e tente novamente.")
-        st.caption(f"Detalhe técnico: {exc}")
-
-if "clips_data" in st.session_state:
-    clips = st.session_state["clips_data"]
-    workdir = st.session_state["clips_dir"]
-    input_path = st.session_state["clips_source"]
-    st.divider()
-    st.header("Seus cortes sugeridos")
-
-    for i, clip in enumerate(clips, start=1):
-        try:
-            start = max(0.0, float(clip["start"]))
-            end = float(clip["end"])
-        except (KeyError, TypeError, ValueError):
-            st.warning(f"Corte {i}: tempos inválidos; ignorado.")
-            continue
-
-        if end <= start:
-            st.warning(f"Corte {i}: o tempo final precisa ser maior que o inicial.")
-            continue
-        if end - start > 120:
-            end = start + 120
-
-        safe_title = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(clip.get("title", f"corte_{i}")))[:45]
-        output_path = Path(workdir) / f"corte_{i}_{safe_title}.mp4"
-        cover_path = Path(workdir) / f"capa_{i}_{safe_title}.jpg"
-
-        with st.expander(f"Corte {i}: {clip.get('title', 'Momento interessante')} ({int(end-start)} s)", expanded=True):
-            st.write(f"**Por que foi escolhido:** {clip.get('reason', 'Momento sugerido pela IA.')}")
-            st.write(f"**Legenda:** {clip.get('caption', '')}")
-            hashtags = clip.get("hashtags", [])
-            if isinstance(hashtags, list):
-                st.write("**Hashtags:** " + " ".join(str(x) for x in hashtags[:5]))
-            st.write(f"**Texto no meio do vídeo:** {clip.get('onscreen_text', '')}")
-            st.write(f"**Texto sugerido para capa:** {clip.get('cover_text', '')}")
-            st.caption(f"Trecho original: {start:.1f}s – {end:.1f}s. Confira se o contexto está correto.")
-
-            if not output_path.exists():
-                cmd = [
-                    "ffmpeg", "-y", "-ss", str(start), "-i", input_path,
-                    "-t", str(end-start), "-c:v", "libx264", "-preset", "veryfast",
-                    "-c:a", "aac", "-movflags", "+faststart", str(output_path)
-                ]
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode != 0:
-                    st.error("Não foi possível criar este corte.")
-                    st.caption(result.stderr[-800:])
-                    continue
-
-            st.video(str(output_path))
-            if not cover_path.exists():
-                cover_cmd = [
-                    "ffmpeg", "-y", "-ss", str(max(0, (end-start)/2)), "-i", str(output_path),
-                    "-frames:v", "1", "-q:v", "2", str(cover_path)
-                ]
-                subprocess.run(cover_cmd, capture_output=True)
-            if cover_path.exists():
-                st.image(str(cover_path), caption="Imagem de capa (quadro do vídeo; texto sugerido acima)", width=260)
-                st.download_button(
-                    f"Baixar capa {i}", data=cover_path.read_bytes(),
-                    file_name=cover_path.name, mime="image/jpeg", key=f"cover_{i}"
-                )
-            st.download_button(
-                f"Baixar corte {i}", data=output_path.read_bytes(),
-                file_name=output_path.name, mime="video/mp4", key=f"clip_{i}"
-            )
-            package_text = (
-                f"TÍTULO: {clip.get('title','')}\n"
-                f"LEGENDA: {clip.get('caption','')}\n"
-                f"HASHTAGS: {' '.join(str(x) for x in hashtags[:5]) if isinstance(hashtags, list) else hashtags}\n"
-                f"TEXTO NO VÍDEO: {clip.get('onscreen_text','')}\n"
-                f"TEXTO DA CAPA: {clip.get('cover_text','')}\n"
-            )
-            st.download_button(
-                f"Baixar informações {i} (.txt)", data=package_text,
-                file_name=f"informacoes_corte_{i}.txt", mime="text/plain", key=f"info_{i}"
-            )
+if "segments" in st.session_state:
+    st.header("Cortes prontos para revisar")
+    for seg in st.session_state["segments"]:
+        n=seg["number"]; start=seg["start"]; end=seg["end"]
+        meta=st.session_state["metadata"].get(n,{})
+        work=st.session_state["workdir"]
+        out=Path(work)/f"corte_{n}.mp4"; cover=Path(work)/f"capa_{n}.jpg"
+        if not out.exists():
+            r=subprocess.run(["ffmpeg","-y","-ss",str(start),"-i",st.session_state["source"],"-t",str(end-start),"-c:v","libx264","-preset","veryfast","-c:a","aac","-movflags","+faststart",str(out)],capture_output=True,text=True)
+            if r.returncode:
+                st.error(f"Falha no corte {n}: {r.stderr[-500:]}")
+                continue
+        title=meta.get("title",f"Batalha de presença — corte {n}")
+        caption=meta.get("caption","Quem levou essa batalha de presença? Comenta aí!")
+        tags=meta.get("hashtags",["#BatalhaDePresença","#TikTokLive","#TikTokBrasil","#AoVivo","#FYP"])
+        if not isinstance(tags,list): tags=["#BatalhaDePresença","#TikTokLive","#TikTokBrasil","#AoVivo","#FYP"]
+        tags=tags[:5]
+        onscreen=meta.get("onscreen_text","Quem levou essa batalha?")
+        cover_text=meta.get("cover_text","BATALHA DE PRESENÇA")
+        with st.expander(f"Corte {n} · {start:.0f}s–{end:.0f}s · {(end-start)/60:.2f} min",expanded=True):
+            st.subheader(title); st.video(str(out))
+            st.write("**Legenda:**",caption)
+            st.write("**Hashtags:**"," ".join(tags))
+            st.write("**Frase no meio do vídeo:**",onscreen)
+            st.write("**Texto sugerido para capa:**",cover_text)
+            if not cover.exists():
+                subprocess.run(["ffmpeg","-y","-ss",str((end-start)/2),"-i",str(out),"-frames:v","1","-q:v","2",str(cover)],capture_output=True)
+            if cover.exists():
+                st.image(str(cover),caption="Quadro extraído do vídeo",width=260)
+                st.download_button(f"Baixar capa {n}",cover.read_bytes(),file_name=f"capa_corte_{n}.jpg",mime="image/jpeg",key=f"cap{n}")
+            st.download_button(f"Baixar vídeo {n}",out.read_bytes(),file_name=f"batalha_presenca_corte_{n}.mp4",mime="video/mp4",key=f"vid{n}")
+            bundle=f"TÍTULO: {title}\nLEGENDA: {caption}\nHASHTAGS: {' '.join(tags)}\nTEXTO NO VÍDEO: {onscreen}\nTEXTO DA CAPA: {cover_text}\n"
+            st.download_button(f"Baixar informações {n}",bundle,file_name=f"informacoes_corte_{n}.txt",mime="text/plain",key=f"info{n}")
