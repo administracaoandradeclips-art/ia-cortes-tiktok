@@ -86,7 +86,7 @@ Os tempos start/end devem ser números em segundos. Inclua exatamente cinco hash
 """
         with st.spinner("O Gemini está analisando o conteúdo..."):
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.8-flash",
                 contents=[video_file, prompt],
                 config=types.GenerateContentConfig(temperature=0.2),
             )
